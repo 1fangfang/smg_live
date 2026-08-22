@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.9
+// @version          0.10
 // @description      打开网页即可收看SMGTV，并解除试看倒计时与切页暂停等限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
 // @icon             https://live.kankanews.com/favicon.ico
-// @updateURL        https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
-// @downloadURL      https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
+// @updateURL        https://raw.githubusercontent.com/1fangfang/smg_live/refs/heads/main/smg_fivestar.user.js
+// @downloadURL      https://raw.githubusercontent.com/1fangfang/smg_live/refs/heads/main/smg_fivestar.user.js
 // @grant            none
 // @run-at           document-start
 // ==/UserScript==
@@ -100,25 +100,211 @@
             console.log('[SMGTV] 已回填频道直播地址');
         }
     }
+    const STREAM_RSA_MODULUS = 'CFE61CCF516E5115E136C414F5111077847648568B67FEA6AD5A181CD5E6687F4F6A2A312514DE8D99AE3AD590301A95F869ECCA3FC01D8785898F8BB63B9E310970EDC33291A993B6A0D664B8D985D956BC90B82211000073161CF0981337EB9040DA6C7A9E27FE8D6C02B4C9A28648175EC4B52A928170DC27BC838F9ADCEF';
+    const STREAM_RSA_EXPONENT = 65537n;
+    function base64ToBytes(b64) {
+        const binary = window.atob(b64);
+        const out = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            out[i] = binary.charCodeAt(i);
+        }
+        return out;
+    }
+    function bytesToBigInt(bytes) {
+        let hex = '';
+        for (let i = 0; i < bytes.length; i++) {
+            hex += bytes[i].toString(16).padStart(2, '0');
+        }
+        return BigInt('0x' + (hex || '0'));
+    }
+    function bigIntToBytes(value, length) {
+        let hex = value.toString(16);
+        if (hex.length % 2) {
+            hex = '0' + hex;
+        }
+        const raw = [];
+        for (let i = 0; i < hex.length; i += 2) {
+            raw.push(parseInt(hex.slice(i, i + 2), 16));
+        }
+        const out = new Uint8Array(length);
+        out.set(raw, Math.max(0, length - raw.length));
+        return out;
+    }
+    function modPow(base, exp, mod) {
+        let result = 1n;
+        let current = base % mod;
+        let exponent = exp;
+        while (exponent > 0n) {
+            if (exponent & 1n) {
+                result = (result * current) % mod;
+            }
+            current = (current * current) % mod;
+            exponent >>= 1n;
+        }
+        return result;
+    }
+    function pkcs1Unpad(block) {
+        let offset = 0;
+        if (block[0] === 0x00) {
+            offset = 1;
+        }
+        if (block[offset] !== 0x01 && block[offset] !== 0x02) {
+            return null;
+        }
+        const sep = block.indexOf(0x00, offset + 1);
+        if (sep < 0) {
+            return null;
+        }
+        return block.slice(sep + 1);
+    }
+    function decryptStreamAddress(encrypted) {
+        if (!encrypted || typeof encrypted !== 'string') {
+            return '';
+        }
+        if (/^https?:\/\//i.test(encrypted)) {
+            return encrypted;
+        }
+        try {
+            const raw = base64ToBytes(encrypted);
+            const modulus = BigInt('0x' + STREAM_RSA_MODULUS);
+            const keySize = STREAM_RSA_MODULUS.length / 2;
+            let plain = '';
+            for (let i = 0; i < raw.length; i += keySize) {
+                const chunk = raw.subarray(i, i + keySize);
+                const decrypted = modPow(bytesToBigInt(chunk), STREAM_RSA_EXPONENT, modulus);
+                const block = bigIntToBytes(decrypted, keySize);
+                const data = pkcs1Unpad(block);
+                if (data && data.length) {
+                    plain += String.fromCharCode.apply(String, data);
+                }
+            }
+            return plain;
+        } catch (e) {
+            return '';
+        }
+    }
+    function getProgramUnixRange(component) {
+        const range = { start: 0, end: 0 };
+        const program = component && component.programObj;
+        const detail = component && component.programDetail;
+        if (program && typeof program.start_time === 'number') {
+            range.start = program.start_time;
+        } else if (detail && typeof detail.start === 'number') {
+            range.start = detail.start;
+        }
+        if (program && typeof program.end_time === 'number') {
+            range.end = program.end_time;
+        } else if (detail && typeof detail.end === 'number') {
+            range.end = detail.end;
+        }
+        return range;
+    }
+    function appendTimeshiftParams(liveUrl, start, end) {
+        if (!liveUrl) {
+            return '';
+        }
+        if (!start || !end || /[?&]start=/.test(liveUrl)) {
+            return liveUrl;
+        }
+        const joiner = liveUrl.indexOf('?') >= 0 ? '&' : '?';
+        return liveUrl + joiner + 'start=' + start + '&end=' + end;
+    }
+    function resolvePlayUrl(component) {
+        ensurePlayableStream(component);
+        const channelInfo = component && component.programDetail && component.programDetail.channel_info || {};
+        const channelDetail = component && component.currChannelDetail || {};
+        const liveEncrypted = channelInfo.live_address || channelDetail.live_address || '';
+        const shiftEncrypted = channelInfo.shift_address || channelDetail.shift_address || '';
+        const isLive = !!(component && component.programObj && component.programObj.play === 1);
+        if (isLive) {
+            return decryptStreamAddress(liveEncrypted);
+        }
+        const officialShift = decryptStreamAddress(shiftEncrypted);
+        if (officialShift) {
+            return officialShift;
+        }
+        const liveUrl = decryptStreamAddress(liveEncrypted);
+        const range = getProgramUnixRange(component);
+        const replayUrl = appendTimeshiftParams(liveUrl, range.start, range.end);
+        if (replayUrl && replayUrl !== liveUrl) {
+            console.log('[SMGTV] 已根据节目时段补全回看地址');
+        }
+        return replayUrl;
+    }
+    function wrapXgplayerCtor(component) {
+        if (!component || typeof component.$xgplayer !== 'function' || component.$xgplayer.__smgWrapped) {
+            return;
+        }
+        const Original = component.$xgplayer;
+        const Wrapped = function(config) {
+            const nextConfig = {};
+            if (config) {
+                Object.keys(config).forEach(function(key) {
+                    nextConfig[key] = config[key];
+                });
+            }
+            if (!nextConfig.url) {
+                const url = resolvePlayUrl(component);
+                if (url) {
+                    nextConfig.url = url;
+                    console.log('[SMGTV] 已补全播放地址');
+                }
+            }
+            return new Original(nextConfig);
+        };
+        Wrapped.__smgWrapped = true;
+        Wrapped.prototype = Original.prototype;
+        try {
+            Object.setPrototypeOf(Wrapped, Original);
+        } catch (e) {}
+        component.$xgplayer = Wrapped;
+    }
+    function applyResolvedPlayUrl(component) {
+        const url = resolvePlayUrl(component);
+        const player = component && component.player;
+        if (!url || !player) {
+            return false;
+        }
+        try {
+            if (player.config) {
+                player.config.url = url;
+                player.config.isLive = !!(component.programObj && component.programObj.play === 1);
+            }
+            if (typeof player.switchURL === 'function') {
+                player.switchURL(url);
+            } else {
+                player.src = url;
+            }
+            if (typeof player.play === 'function') {
+                player.play();
+            }
+            console.log('[SMGTV] 已切换到回看/直播地址');
+            return true;
+        } catch (e) {
+            console.warn('[SMGTV] 切换播放地址失败', e);
+            return false;
+        }
+    }
     function recoverPlayerIfNeeded(component) {
-        if (!component || typeof component.initPlayer !== 'function' || component.__smgRecovering) {
+        if (!component || component.__smgRecovering) {
             return;
         }
         const video = getPlayerVideo(component);
-        const mediaError = video?.error;
+        const mediaError = video && video.error;
         if (!(component.player && mediaError && mediaError.code === 4)) {
             return;
         }
-        ensurePlayableStream(component);
-        const hasLive = !!(component.programDetail?.channel_info?.live_address ||
-            component.currChannelDetail?.live_address);
-        if (!hasLive) {
+        const url = resolvePlayUrl(component);
+        if (!url) {
             return;
         }
         component.__smgRecovering = true;
         console.log('[SMGTV] 检测到无效播放地址，正在重新初始化播放器');
-        component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
-        setTimeout(() => {
+        wrapXgplayerCtor(component);
+        if (!applyResolvedPlayUrl(component) && typeof component.initPlayer === 'function') {
+            component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
+        }
+        setTimeout(function() {
             component.__smgRecovering = false;
         }, 2000);
     }
@@ -428,10 +614,20 @@
             return;
         }
         const wrapped = function() {
+            const firstArg = arguments[0];
+            if (firstArg && typeof firstArg === 'object' &&
+                ('can_review' in firstArg || 'is_shield' in firstArg || 'is_review' in firstArg)) {
+                unlockProgramFlags(firstArg);
+            }
+            wrapXgplayerCtor(this);
             ensurePlayableStream(this);
             const result = original.apply(this, arguments);
             const runAfter = () => {
                 ensurePlayableStream(this);
+                wrapXgplayerCtor(this);
+                if (this.player && this.player.config && !this.player.config.url) {
+                    applyResolvedPlayUrl(this);
+                }
                 setTimeout(() => after(this), 0);
                 setTimeout(() => after(this), 250);
                 setTimeout(() => after(this), 1000);
@@ -487,6 +683,7 @@
         ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel', 'getProgramDetail'].forEach(methodName => {
             wrapComponentMethod(component, methodName, syncLoadingState);
         });
+        wrapXgplayerCtor(component);
         ensurePlayableStream(component);
         syncLoadingState(component);
         console.log('[SMGTV] 页面限制补丁已生效');
@@ -511,6 +708,9 @@
     injectStyle(`
     .video-tip {
         display: none !important;
+    }
+    .program-box-container .program-list li.dateout {
+        cursor: pointer !important;
     }
     body.${VIDEO_READY_CLASS} .loading-mask {
         display: none !important;
